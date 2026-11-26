@@ -16,3 +16,7 @@ docker compose exec -T app python -m venuegate.entry evaluate --input sample_dat
 ```
 
 在网页筛选单号、作业区或原因，点击结果中的单号查看完整字段与处置证据。下载 JSON 可检视结果、对照原始资料摘要和模型特征版本。
+
+## 入口选用核对
+
+`GET /api/venuegate/stages/gate_backtest` 和总览返回的 `model_selection` 列出每个入口获准的预测模型、选用原因、两套模型在同一批成熟回放实绩上的平均绝对误差与越线漏报批数，以及同源校准样本数。总览的 `selection_digest` 是选用结论摘要，已计入批次凭证：同一批单据重跑时摘要、`run_id` 和派岗逐单一致。每条当班单的 `forecast_model` 与 `selection_reason` 显示该单实际采用的模型；区间显示为 `–` 表示该入口缺成熟校准样本，已转人工判读。

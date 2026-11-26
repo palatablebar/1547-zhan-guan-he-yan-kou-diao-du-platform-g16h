@@ -7,6 +7,9 @@ from .ticket_windows import service as cohort_service
 from .arrival_exposure import service as feature_service
 from .visitor_counts import service as model_service
 from .gate_backtest import service as calibration_service
+from .gate_backtest import model_choice
+from .gate_backtest.calibration import assess_live, build_entrance_calibrations
+from .gate_backtest.contracts import BASELINE_MODEL
 from .venue_shift import service as monitor_service
 from .usher_capacity import service as dispatch_service
 from .entrance_register import service as audit_service
@@ -50,7 +53,7 @@ def stage_at(index, details, records, issues=()):
     return {'key': code, 'title': title, 'summary': details, 'records': list(records), 'errors': list(issues)}
 
 
-def rows_for(plan, scored, vectors):
+def rows_for(plan, scored, vectors, board):
     by_key = {item.key: item for item in scored}
     factor_names = ('单口预约', '校团集中度', '换场接驳压力', '早到雨压', '团队与核验口比')
     order = []
@@ -62,8 +65,12 @@ def rows_for(plan, scored, vectors):
         else:
             driver = ' · '.join(f'{amount:+.2f}' for amount in point.contributions)
         interval = ('–' if job.lower is None else f'{job.lower:.2f}–{job.upper:.2f}')
+        entrance = board.for_cohort(job.cohort)
+        chosen = entrance.chosen if entrance is not None else BASELINE_MODEL
         order.append({'key': job.key, 'zone': job.cohort, 'estimate': job.estimate, 'interval': interval,
                       'state': job.state, 'cost': job.cost, 'reason': job.reason, 'evidence': job.summary,
+                      'forecast_model': chosen,
+                      'selection_reason': entrance.reason if entrance is not None else model_choice.REASON_NO_REPLAY,
                       'drivers': driver, 'missing': len(point.missing), 'hits': list(job.rule_hits),
                       'measurements': dict(zip(('reservations', 'school_groups', 'rain_mm', 'turnstiles', 'transfer_min', 'bus_eta'), point.input_values, strict=True)),
                       'unmeasured': list(point.missing), 'operations': feature_service.business_factors(vectors[job.key])})
@@ -79,6 +86,13 @@ def comparison_rows(predictions):
 def replay_metrics(report):
     result = [{'label': '回放实绩样本', 'value': report.count}, {'label': '回放绝对误差', 'value': report.mae}]
     return result
+
+
+def model_choice_digest(board):
+    """入口选用结论的稳定摘要，进入凭证以保证重跑同一批选用与派岗一致。"""
+    tokens = tuple((choice.cohort, choice.chosen, choice.reason, choice.replay_count,
+                    choice.calibration_size) for choice in board.choices)
+    return audit_service.stable_digest(tokens)[:12]
 
 
 def worksheet(documents, as_of):
@@ -111,11 +125,21 @@ def execute(documents, capacity=12, mode='balanced', *, as_of=96):
     kernel, fitted_calibration, (recent, shift) = calibrate_cell(features, state)
     evaluated = recent[1]
     scored, checked_live = shift
+    # 入场回放：同一批成熟实绩上为每个入口选用获准预测，并按同源校准区间派岗
+    board = model_choice.choose_entrance_models(
+        kernel, state.fingerprint, features.replay, features.train)
+    board = model_choice.register_unsampled_entrances(
+        board, (*features.replay, *features.live))
+    board, entrance_verifications, conversion = build_entrance_calibrations(
+        board, kernel, state.fingerprint, features.train, features.calibration)
+    checked_live = assess_live(
+        board, entrance_verifications, kernel, state.fingerprint, conversion, features.live)
     previous=monitor_service.fit_baseline(features.train,state.fingerprint)
     drift=monitor_service.scan_current(previous,features.live,state.fingerprint)
     coverage=monitor_service.coverage_by_group(features.calibration,features.live)
     allocation=dispatch_service.plan_jobs(checked_live,drift.domain,capacity,mode)
-    closed=audit_service.close_batch(documents,intake,windows,allocation,state.fingerprint,kernel.name,mode)
+    closed=audit_service.close_batch(documents,intake,windows,allocation,state.fingerprint,
+                                     f'{kernel.name}|选用{model_choice_digest(board)}',mode)
     performance=calibration_service.performance(evaluated)
     states = dict(closed.totals.states)
     overview = [
@@ -126,7 +150,7 @@ def execute(documents, capacity=12, mode='balanced', *, as_of=96):
         {'label': '额度结余', 'value': allocation.balance},
     ]
     vectors = {item.key: item for item in features.live}
-    row_list = rows_for(allocation, scored, vectors)
+    row_list = rows_for(allocation, scored, vectors, board)
     operating_rows = dispatch_service.operating_ledger(row_list)
     overtime = calibration_service.boundary_diagnostics(evaluated, 155)
     sector = calibration_service.sector_replay(evaluated, 155)
@@ -140,7 +164,9 @@ def execute(documents, capacity=12, mode='balanced', *, as_of=96):
         stage_at(1, f'拟合 {len(windows.train)} 条，校准 {len(windows.calibration)} 条，回放 {len(windows.replay)} 条', cohort_service.window_evidence(windows) + cohort_service.readiness_evidence(windows, as_of)),
         stage_at(2, '特征转换版本 ' + state.fingerprint, features_glance),
         stage_at(3, kernel.name, weight_rows + model_service.inspection_rows(kernel, features) + comparison_rows(scored)),
-        stage_at(4, f'{fitted_calibration.method} · {performance.status} · {performance.count} 条回放实绩', calibration_service.calibration_evidence(performance) + [overtime] + sector),
+        stage_at(4, f'{fitted_calibration.method} · {performance.status} · {performance.count} 条回放实绩',
+                 model_choice.selection_evidence(board)
+                 + calibration_service.calibration_evidence(performance) + [overtime] + sector),
         stage_at(5, f'{drift.status} · {len(drift.domain)} 张单据需外推判读', monitor_service.shift_evidence(drift, coverage) + operating_shift),
         stage_at(6, f'本班占用 {allocation.capacity-allocation.balance} / {allocation.capacity} 个工位单位', dispatch_service.action_evidence(allocation) + dispatch_service.operating_group(checked_live, allocation)),
         stage_at(7, f'处置凭证 {closed.stamp} · 额度守恒', audit_service.reconciliation_evidence(closed) + field_evidence['执行业务单']),
@@ -163,6 +189,8 @@ def execute(documents, capacity=12, mode='balanced', *, as_of=96):
     overview_report = {'capacity' : capacity, 'mode': mode, 'as_of': as_of, 'sample_hash': closed.batch_hash,
               'policy_hash': closed.policy_hash, 'feature_stamp': state.fingerprint,
               'model': kernel.name, 'run_id': closed.stamp, 'object_name': DISPLAY['object_name'],
+              'model_selection': model_choice.selection_evidence(board),
+              'selection_digest': model_choice_digest(board),
               'unit': DISPLAY['unit'], 'sections': details, 'flow_counts': list(states.items()),
               'measures': {'reservations': ('预约票量', '张'),
  'school_groups': ('已申报团队', '团'),
